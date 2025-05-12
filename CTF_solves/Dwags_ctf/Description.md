@@ -1,0 +1,1 @@
+This chall has there win address win1 , win2 and win3 , there is direct jump to win1 and we need to control rdi for win2 and jump there and we need to control rdi, rsi and rdx to set the values and jump to win3 , to get each flag parts from that.
