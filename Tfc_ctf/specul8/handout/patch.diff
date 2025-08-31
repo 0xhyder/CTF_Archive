@@ -1,0 +1,562 @@
+diff --git a/src/builtins/builtins-definitions.h b/src/builtins/builtins-definitions.h
+index 46a0c9f6562..eed852c2cff 100644
+--- a/src/builtins/builtins-definitions.h
++++ b/src/builtins/builtins-definitions.h
+@@ -1454,6 +1454,7 @@ namespace internal {
+   /* String helpers */                                                         \
+   TFS(StringAdd_CheckNone, NeedsContext::kYes, kLeft, kRight)                  \
+   TFS(SubString, NeedsContext::kYes, kString, kFrom, kTo)                      \
++  TFS(StringMultiply, NeedsContext::kYes, kString, kCount)                     \
+                                                                                \
+   /* Miscellaneous */                                                          \
+   ASM(DoubleToI, Void)                                                         \
+diff --git a/src/builtins/builtins-string-gen.cc b/src/builtins/builtins-string-gen.cc
+index aa5f850fa87..494796ce95b 100644
+--- a/src/builtins/builtins-string-gen.cc
++++ b/src/builtins/builtins-string-gen.cc
+@@ -687,6 +687,69 @@ TF_BUILTIN(SubString, StringBuiltinsAssembler) {
+   Return(SubString(string, SmiUntag(from), SmiUntag(to)));
+ }
+ 
++TF_BUILTIN(StringMultiply, StringBuiltinsAssembler) {
++  // auto context = Parameter<Context>(Descriptor::kContext);
++  auto arg_str = Parameter<String>(Descriptor::kString);
++  auto arg_count = Parameter<Object>(Descriptor::kCount);
++
++  TVARIABLE(IntPtrT, count);
++  TVARIABLE(String, var_result, EmptyStringConstant());
++  Label count_is_smi(this), count_is_not_smi(this), multiply(this), out(this);
++  Branch(TaggedIsSmi(arg_count), &count_is_smi, &count_is_not_smi);
++
++  BIND(&count_is_smi);
++  {
++    // make sure count is not negative
++    GotoIfNot(IntPtrGreaterThan(SmiUntag(CAST(arg_count)), IntPtrConstant(0)), &out);
++    count = SmiUntag(CAST(arg_count));
++    Goto(&multiply);
++  }
++
++  BIND(&count_is_not_smi);
++  {
++    TNode<HeapObject> heap_count = CAST(arg_count);
++    GotoIfNot(IsHeapNumber(heap_count), &count_is_smi);
++    GotoIf(TaggedIsSmi(arg_count), &count_is_smi);
++    GotoIfNot(Float64GreaterThan(LoadHeapNumberValue(heap_count),
++                                 Float64Constant(0.0)), &out);
++    count = ChangeFloat64ToIntPtr(LoadHeapNumberValue(heap_count));
++    Goto(&multiply);
++  }
++
++  BIND(&multiply);
++  {
++    TVARIABLE(IntPtrT, idx, IntPtrConstant(0));
++    TVARIABLE(String, var_arg_str, arg_str);
++
++    TNode<IntPtrT> str_length = LoadStringLengthAsWord(arg_str);
++    TNode<IntPtrT> new_length = IntPtrMul(str_length, count.value());
++    var_result = AllocateNonEmptySeqOneByteString(
++      Unsigned(TruncateIntPtrToInt32(new_length))
++    );
++
++    Label concat_loop(this, &idx);
++    Goto(&concat_loop);
++    BIND(&concat_loop);
++    {
++      GotoIf(IntPtrEqual(idx.value(), new_length), &out);
++      GotoIf(IntPtrGreaterThan( // nu bagi cate baxuri vrei tu in bolid boss
++          IntPtrAdd(idx.value(), str_length), 
++          IntPtrConstant(String::kMaxLength)
++        ), &out
++      );
++      CopyStringCharacters(var_arg_str.value(), var_result.value(), IntPtrConstant(0),
++                           idx.value(),
++                           str_length,
++                           String::ONE_BYTE_ENCODING,
++                           String::ONE_BYTE_ENCODING);
++      idx = IntPtrAdd(idx.value(), str_length);
++      Goto(&concat_loop);
++    }
++  }
++  BIND(&out);
++  Return(var_result.value());
++}
++
+ void StringBuiltinsAssembler::GenerateStringRelationalComparison(
+     TNode<String> left, TNode<String> right, StringComparison op) {
+   TVARIABLE(String, var_left, left);
+diff --git a/src/codegen/code-factory.cc b/src/codegen/code-factory.cc
+index 606d885b42b..13e787f986c 100644
+--- a/src/codegen/code-factory.cc
++++ b/src/codegen/code-factory.cc
+@@ -55,6 +55,10 @@ Callable CodeFactory::StringAdd(Isolate* isolate, StringAddFlags flags) {
+   return Builtins::CallableFor(isolate, Builtins::StringAdd(flags));
+ }
+ 
++Callable CodeFactory::StringMultiply(Isolate* isolate) {
++  return Builtins::CallableFor(isolate, Builtin::kStringMultiply);
++}
++
+ // static
+ Callable CodeFactory::FastNewFunctionContext(Isolate* isolate,
+                                              ScopeType scope_type) {
+diff --git a/src/codegen/code-factory.h b/src/codegen/code-factory.h
+index df32614b67e..2abcf6431a8 100644
+--- a/src/codegen/code-factory.h
++++ b/src/codegen/code-factory.h
+@@ -45,6 +45,8 @@ class V8_EXPORT_PRIVATE CodeFactory final {
+   static Callable StringAdd(Isolate* isolate,
+                             StringAddFlags flags = STRING_ADD_CHECK_NONE);
+ 
++  static Callable StringMultiply(Isolate* isolate);
++
+   static Callable FastNewFunctionContext(Isolate* isolate,
+                                          ScopeType scope_type);
+ 
+diff --git a/src/compiler/js-typed-lowering.cc b/src/compiler/js-typed-lowering.cc
+index ed45cea961e..d2d665b96bb 100644
+--- a/src/compiler/js-typed-lowering.cc
++++ b/src/compiler/js-typed-lowering.cc
+@@ -2738,6 +2738,36 @@ Reduction JSTypedLowering::ReduceJSResolvePromise(Node* node) {
+   return NoChange();
+ }
+ 
++Reduction JSTypedLowering::GenerateStringMultiply(
++    Node* node, Node* left, Node* right, Node* context, Node* frame_state,
++    Node** effect, Node** control) {
++  // call StringMultiply builtin
++  Callable const callable = CodeFactory::StringMultiply(isolate());
++  auto call_descriptor = Linkage::GetStubCallDescriptor(
++        graph()->zone(), callable.descriptor(),
++        callable.descriptor().GetStackParameterCount(),
++        CallDescriptor::kNeedsFrameState, node->op()->properties());
++  DCHECK_EQ(1, OperatorProperties::GetFrameStateInputCount(node->op()));
++  node->RemoveInput(JSBinaryOpNode::FeedbackVectorIndex());
++  node->InsertInput(graph()->zone(), 0,
++                    jsgraph()->HeapConstantNoHole(callable.code()));
++  NodeProperties::ChangeOp(node, common()->Call(call_descriptor));
++  return Changed(node);
++}
++
++Reduction JSTypedLowering::ReduceJSMultiply(Node *node) {
++  JSBinopReduction r(this, node);
++  if (r.LeftInputIs(Type::String())) {
++    Node* context = NodeProperties::GetContextInput(node);
++    Node* frame_state = NodeProperties::GetFrameStateInput(node);
++    Node* effect = NodeProperties::GetEffectInput(node);
++    Node* control = NodeProperties::GetControlInput(node);
++    return GenerateStringMultiply(node, r.left(), r.right(), context,
++                                  frame_state, &effect, &control);
++  }
++  return ReduceNumberBinop(node);
++}
++
+ Reduction JSTypedLowering::Reduce(Node* node) {
+   switch (node->opcode()) {
+     case IrOpcode::kJSEqual:
+@@ -2760,8 +2790,9 @@ Reduction JSTypedLowering::Reduce(Node* node) {
+       return ReduceUI32Shift(node, kUnsigned);
+     case IrOpcode::kJSAdd:
+       return ReduceJSAdd(node);
+-    case IrOpcode::kJSSubtract:
+     case IrOpcode::kJSMultiply:
++      return ReduceJSMultiply(node);
++    case IrOpcode::kJSSubtract:
+     case IrOpcode::kJSDivide:
+     case IrOpcode::kJSModulus:
+     case IrOpcode::kJSExponentiate:
+diff --git a/src/compiler/js-typed-lowering.h b/src/compiler/js-typed-lowering.h
+index d72bd0c06ac..9256c8b6476 100644
+--- a/src/compiler/js-typed-lowering.h
++++ b/src/compiler/js-typed-lowering.h
+@@ -42,6 +42,7 @@ class V8_EXPORT_PRIVATE JSTypedLowering final
+   friend class JSBinopReduction;
+ 
+   Reduction ReduceJSAdd(Node* node);
++  Reduction ReduceJSMultiply(Node* node);
+   Reduction ReduceJSBitwiseNot(Node* node);
+   Reduction ReduceJSDecrement(Node* node);
+   Reduction ReduceJSIncrement(Node* node);
+@@ -100,6 +101,11 @@ class V8_EXPORT_PRIVATE JSTypedLowering final
+   Node* UnwrapStringWrapper(Node* string_or_wrapper, Node** effect,
+                             Node** control);
+ 
++  
++  Reduction GenerateStringMultiply(
++    Node* node, Node* left, Node* right, Node* context, Node* frame_state,
++    Node** effect, Node** control);
++
+   Factory* factory() const;
+   TFGraph* graph() const;
+   JSGraph* jsgraph() const { return jsgraph_; }
+diff --git a/src/compiler/simplified-lowering.cc b/src/compiler/simplified-lowering.cc
+index e2a9dc51eb6..5aef0a9aa35 100644
+--- a/src/compiler/simplified-lowering.cc
++++ b/src/compiler/simplified-lowering.cc
+@@ -1993,12 +1993,13 @@ class RepresentationSelector {
+             // The bounds check is redundant if we already know that
+             // the index is within the bounds of [0.0, length[.
+             // TODO(neis): Move this into TypedOptimization?
+-            if (v8_flags.turbo_typer_hardening) {
+-              new_flags |= CheckBoundsFlag::kAbortOnOutOfBounds;
+-            } else {
++            // if (v8_flags.turbo_typer_hardening) {
++            //   new_flags |= CheckBoundsFlag::kAbortOnOutOfBounds;
++            // } else {
++
+               DeferReplacement(node, NodeProperties::GetValueInput(node, 0));
+               return;
+-            }
++            // }
+           }
+           ChangeOp(node,
+                    simplified()->CheckedUint32Bounds(feedback, new_flags));
+diff --git a/src/compiler/turbofan-typer.cc b/src/compiler/turbofan-typer.cc
+index af3245dc2f3..7e8b48f22fd 100644
+--- a/src/compiler/turbofan-typer.cc
++++ b/src/compiler/turbofan-typer.cc
+@@ -1429,6 +1429,16 @@ Type Typer::Visitor::JSSubtractTyper(Type lhs, Type rhs, Typer* t) {
+ }
+ 
+ Type Typer::Visitor::JSMultiplyTyper(Type lhs, Type rhs, Typer* t) {
++  lhs = ToPrimitive(lhs, t);
++  rhs = ToPrimitive(rhs, t);
++  if (lhs.Maybe(Type::String())) {
++    if (lhs.Is(Type::String()) && rhs.Is(Type::Number())) {
++      std::cout << "JSMultiplyTyper: lhs is string and rhs is number" << std::endl;
++      return Type::String();
++    } else {
++      return Type::NumericOrString();
++    }
++  }
+   return BinaryNumberOpTyper(lhs, rhs, t, NumberMultiply);
+ }
+ 
+diff --git a/src/compiler/verifier.cc b/src/compiler/verifier.cc
+index 7a69a2dbf31..dcf2bd201f9 100644
+--- a/src/compiler/verifier.cc
++++ b/src/compiler/verifier.cc
+@@ -667,6 +667,9 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
+     case IrOpcode::kJSAdd:
+       CheckTypeIs(node, Type::NumericOrString());
+       break;
++    case IrOpcode::kJSMultiply:
++      CheckTypeIs(node, Type::NumericOrString());
++      break;
+     case IrOpcode::kJSBitwiseOr:
+     case IrOpcode::kJSBitwiseXor:
+     case IrOpcode::kJSBitwiseAnd:
+@@ -674,7 +677,6 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
+     case IrOpcode::kJSShiftRight:
+     case IrOpcode::kJSShiftRightLogical:
+     case IrOpcode::kJSSubtract:
+-    case IrOpcode::kJSMultiply:
+     case IrOpcode::kJSDivide:
+     case IrOpcode::kJSModulus:
+     case IrOpcode::kJSExponentiate:
+diff --git a/src/d8/d8.cc b/src/d8/d8.cc
+index d660640bb97..81359f03269 100644
+--- a/src/d8/d8.cc
++++ b/src/d8/d8.cc
+@@ -3890,53 +3890,54 @@ Local<FunctionTemplate> Shell::CreateNodeTemplates(
+ 
+ Local<ObjectTemplate> Shell::CreateGlobalTemplate(Isolate* isolate) {
+   Local<ObjectTemplate> global_template = ObjectTemplate::New(isolate);
+-  global_template->Set(Symbol::GetToStringTag(isolate),
+-                       String::NewFromUtf8Literal(isolate, "global"));
++  // remove uninteded solutions
++  // global_template->Set(Symbol::GetToStringTag(isolate),
++                      //  String::NewFromUtf8Literal(isolate, "global"));
+   global_template->Set(isolate, "version",
+                        FunctionTemplate::New(isolate, Version));
+ 
+-  global_template->Set(isolate, "print", FunctionTemplate::New(isolate, Print));
+-  global_template->Set(isolate, "printErr",
+-                       FunctionTemplate::New(isolate, PrintErr));
+-  global_template->Set(isolate, "write",
+-                       FunctionTemplate::New(isolate, WriteStdout));
+-  if (!i::v8_flags.fuzzing) {
+-    global_template->Set(isolate, "writeFile",
+-                         FunctionTemplate::New(isolate, WriteFile));
+-  }
+-  global_template->Set(isolate, "read",
+-                       FunctionTemplate::New(isolate, ReadFile));
+-  global_template->Set(isolate, "readbuffer",
+-                       FunctionTemplate::New(isolate, ReadBuffer));
+-  global_template->Set(isolate, "readline",
+-                       FunctionTemplate::New(isolate, ReadLine));
+-  global_template->Set(isolate, "load",
+-                       FunctionTemplate::New(isolate, ExecuteFile));
+-  global_template->Set(isolate, "setTimeout",
+-                       FunctionTemplate::New(isolate, SetTimeout));
++  // global_template->Set(isolate, "print", FunctionTemplate::New(isolate, Print));
++  // global_template->Set(isolate, "printErr",
++                      //  FunctionTemplate::New(isolate, PrintErr));
++  // global_template->Set(isolate, "write",
++                      //  FunctionTemplate::New(isolate, WriteStdout));
++  // if (!i::v8_flags.fuzzing) {
++    // global_template->Set(isolate, "writeFile",
++                        //  FunctionTemplate::New(isolate, WriteFile));
++  // }
++  // global_template->Set(isolate, "read",
++                      //  FunctionTemplate::New(isolate, ReadFile));
++  // global_template->Set(isolate, "readbuffer",
++                      //  FunctionTemplate::New(isolate, ReadBuffer));
++  // global_template->Set(isolate, "readline",
++                      //  FunctionTemplate::New(isolate, ReadLine));
++  // global_template->Set(isolate, "load",
++                      //  FunctionTemplate::New(isolate, ExecuteFile));
++  // global_template->Set(isolate, "setTimeout",
++                      //  FunctionTemplate::New(isolate, SetTimeout));
+   // Some Emscripten-generated code tries to call 'quit', which in turn would
+   // call C's exit(). This would lead to memory leaks, because there is no way
+   // we can terminate cleanly then, so we need a way to hide 'quit'.
+   if (!options.omit_quit) {
+     global_template->Set(isolate, "quit", FunctionTemplate::New(isolate, Quit));
+   }
+-  global_template->Set(isolate, "testRunner",
+-                       Shell::CreateTestRunnerTemplate(isolate));
+-  global_template->Set(isolate, "Realm", Shell::CreateRealmTemplate(isolate));
+-  global_template->Set(isolate, "performance",
+-                       Shell::CreatePerformanceTemplate(isolate));
+-  global_template->Set(isolate, "Worker", Shell::CreateWorkerTemplate(isolate));
++  // global_template->Set(isolate, "testRunner",
++                      //  Shell::CreateTestRunnerTemplate(isolate));
++  // global_template->Set(isolate, "Realm", Shell::CreateRealmTemplate(isolate));
++  // global_template->Set(isolate, "performance",
++                      //  Shell::CreatePerformanceTemplate(isolate));
++  // global_template->Set(isolate, "Worker", Shell::CreateWorkerTemplate(isolate));
+ 
+   // Prevent fuzzers from creating side effects.
+-  if (!i::v8_flags.fuzzing) {
+-    global_template->Set(isolate, "os", Shell::CreateOSTemplate(isolate));
+-  }
+-  global_template->Set(isolate, "d8", Shell::CreateD8Template(isolate));
++  // if (!i::v8_flags.fuzzing) {
++    // global_template->Set(isolate, "os", Shell::CreateOSTemplate(isolate));
++  // }
++  // global_template->Set(isolate, "d8", Shell::CreateD8Template(isolate));
+ 
+-  if (i::v8_flags.expose_async_hooks) {
+-    global_template->Set(isolate, "async_hooks",
+-                         Shell::CreateAsyncHookTemplate(isolate));
+-  }
++  // if (i::v8_flags.expose_async_hooks) {
++  //   global_template->Set(isolate, "async_hooks",
++  //                        Shell::CreateAsyncHookTemplate(isolate));
++  // }
+ 
+   return global_template;
+ }
+@@ -4288,14 +4289,14 @@ void Shell::Initialize(Isolate* isolate, D8Console* console,
+             v8::Isolate::kMessageLog);
+   }
+ 
+-  isolate->SetHostImportModuleDynamicallyCallback(
+-      Shell::HostImportModuleDynamically);
+-  isolate->SetHostImportModuleWithPhaseDynamicallyCallback(
+-      Shell::HostImportModuleWithPhaseDynamically);
+-  isolate->SetHostInitializeImportMetaObjectCallback(
+-      Shell::HostInitializeImportMetaObject);
+-  isolate->SetHostCreateShadowRealmContextCallback(
+-      Shell::HostCreateShadowRealmContext);
++  // isolate->SetHostImportModuleDynamicallyCallback(
++  //     Shell::HostImportModuleDynamically);
++  // isolate->SetHostImportModuleWithPhaseDynamicallyCallback(
++  //     Shell::HostImportModuleWithPhaseDynamically);
++  // isolate->SetHostInitializeImportMetaObjectCallback(
++  //     Shell::HostInitializeImportMetaObject);
++  // isolate->SetHostCreateShadowRealmContextCallback(
++  //     Shell::HostCreateShadowRealmContext);
+ 
+   debug::SetConsoleDelegate(isolate, console);
+ }
+diff --git a/src/ic/binary-op-assembler.cc b/src/ic/binary-op-assembler.cc
+index e9b6b9446eb..7b8205cbae3 100644
+--- a/src/ic/binary-op-assembler.cc
++++ b/src/ic/binary-op-assembler.cc
+@@ -752,24 +752,95 @@ TNode<Object> BinaryOpAssembler::Generate_SubtractWithFeedback(
+       floatFunction, Operation::kSubtract, update_feedback_mode, rhs_known_smi);
+ }
+ 
++TNode<Object> BinaryOpAssembler::Generate_StringMultiplyWithFeedback(
++  const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
++  TNode<UintPtrT> slot_id, const LazyNode<HeapObject>& maybe_feedback_vector,
++  UpdateFeedbackMode update_feedback_mode) {
++
++  // String Multiplication implementation
++  TNode<String> lhs_string = CAST(lhs);
++
++  TVARIABLE(Smi, var_type_feedback);
++  TVARIABLE(Object, var_result);
++
++  var_type_feedback = SmiConstant(BinaryOperationFeedback::kString);
++  UpdateFeedback(var_type_feedback.value(), maybe_feedback_vector(),
++                slot_id, update_feedback_mode);
++  var_result = CallBuiltin(Builtin::kStringMultiply, context(), lhs_string,
++                rhs);
++  return var_result.value();
++}
++
+ TNode<Object> BinaryOpAssembler::Generate_MultiplyWithFeedback(
+     const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
+     TNode<UintPtrT> slot_id, const LazyNode<HeapObject>& maybe_feedback_vector,
+     UpdateFeedbackMode update_feedback_mode, bool rhs_known_smi) {
+-  auto smiFunction = [=, this](TNode<Smi> lhs, TNode<Smi> rhs,
+-                               TVariable<Smi>* var_type_feedback) {
+-    TNode<Number> result = SmiMul(lhs, rhs);
+-    *var_type_feedback = SelectSmiConstant(
+-        TaggedIsSmi(result), BinaryOperationFeedback::kSignedSmall,
+-        BinaryOperationFeedback::kNumber);
+-    return result;
+-  };
+-  auto floatFunction = [=, this](TNode<Float64T> lhs, TNode<Float64T> rhs) {
+-    return Float64Mul(lhs, rhs);
+-  };
+-  return Generate_BinaryOperationWithFeedback(
++
++  Label if_lhs_is_string(this, Label::kDeferred), normal_mul_case(this), end(this);
++  TVARIABLE(Object, var_result);
++  
++  GotoIf(TaggedIsSmi(lhs), &normal_mul_case);
++  Branch(
++      IsStringInstanceType(LoadInstanceType(CAST(lhs))), &if_lhs_is_string,
++      &normal_mul_case);
++
++  BIND(&if_lhs_is_string);
++  {
++    Label rhs_is_not_smi(this), rhs_is_smi(this);
++    Branch(TaggedIsSmi(rhs), &rhs_is_smi, &rhs_is_not_smi);
++
++    BIND(&rhs_is_not_smi);
++    {
++      // Check if {rhs} is a HeapNumber.
++      TNode<HeapObject> rhs_heap_object = CAST(rhs);
++      GotoIfNot(IsHeapNumber(rhs_heap_object), &normal_mul_case);
++      GotoIfNot(
++          Float64GreaterThan(
++              LoadHeapNumberValue(rhs_heap_object),
++              Float64Constant(1)),
++          &normal_mul_case);
++
++      var_result = Generate_StringMultiplyWithFeedback(
++          context, lhs, rhs, slot_id, maybe_feedback_vector,
++          update_feedback_mode);
++      Goto(&end);
++    }
++
++    BIND(&rhs_is_smi);
++    {
++      GotoIfNot(
++          SmiGreaterThan(
++              CAST(rhs), SmiConstant(0)),
++          &normal_mul_case);
++
++      var_result = Generate_StringMultiplyWithFeedback(
++          context, lhs, rhs, slot_id, maybe_feedback_vector,
++          update_feedback_mode);
++      Goto(&end);
++    }
++  }
++
++  BIND(&normal_mul_case);
++  {
++    auto smiFunction = [=, this](TNode<Smi> lhs, TNode<Smi> rhs,
++      TVariable<Smi>* var_type_feedback) {
++      TNode<Number> result = SmiMul(lhs, rhs);
++      *var_type_feedback = SelectSmiConstant(
++      TaggedIsSmi(result), BinaryOperationFeedback::kSignedSmall,
++      BinaryOperationFeedback::kNumber);
++      return result;
++    };
++    auto floatFunction = [=, this](TNode<Float64T> lhs, TNode<Float64T> rhs) {
++      return Float64Mul(lhs, rhs);
++    };
++    var_result = Generate_BinaryOperationWithFeedback(
+       context, lhs, rhs, slot_id, maybe_feedback_vector, smiFunction,
+       floatFunction, Operation::kMultiply, update_feedback_mode, rhs_known_smi);
++    Goto(&end);
++  }
++
++  BIND(&end);
++  return var_result.value();
+ }
+ 
+ TNode<Object> BinaryOpAssembler::Generate_DivideWithFeedback(
+diff --git a/src/ic/binary-op-assembler.h b/src/ic/binary-op-assembler.h
+index 014673634c2..49d2b3919f7 100644
+--- a/src/ic/binary-op-assembler.h
++++ b/src/ic/binary-op-assembler.h
+@@ -31,6 +31,11 @@ class BinaryOpAssembler : public CodeStubAssembler {
+       TNode<UintPtrT> slot, const LazyNode<HeapObject>& maybe_feedback_vector,
+       UpdateFeedbackMode update_feedback_mode, bool rhs_known_smi);
+ 
++  TNode<Object> Generate_StringMultiplyWithFeedback(
++        const LazyNode<Context>& context, TNode<Object> lhs, TNode<Object> rhs,
++        TNode<UintPtrT> slot_id, const LazyNode<HeapObject>& maybe_feedback_vector,
++        UpdateFeedbackMode update_feedback_mode);
++
+   TNode<Object> Generate_MultiplyWithFeedback(
+       const LazyNode<Context>& context, TNode<Object> left, TNode<Object> right,
+       TNode<UintPtrT> slot, const LazyNode<HeapObject>& maybe_feedback_vector,
+diff --git a/src/objects/object-type.cc b/src/objects/object-type.cc
+index bf10b025f37..9d2896c73a2 100644
+--- a/src/objects/object-type.cc
++++ b/src/objects/object-type.cc
+@@ -13,7 +13,8 @@ namespace internal {
+ 
+ Address CheckObjectType(Address raw_value, Address raw_type,
+                         Address raw_location) {
+-#ifdef DEBUG
++// #ifdef DEBUG
++#ifdef CACA // disable this for now
+   ObjectType type = static_cast<ObjectType>(Tagged<Smi>(raw_type).value());
+   Tagged<String> location = Cast<String>(Tagged<Object>(raw_location));
+   const char* expected;
+@@ -81,7 +82,8 @@ Address CheckObjectType(Address raw_value, Address raw_type,
+       "  Expected %s but found %s",
+       location->ToAsciiArray(), expected, value_description.str().c_str());
+ #else
+-  UNREACHABLE();
++//   UNREACHABLE();
++  return Smi::FromInt(0).ptr();
+ #endif
+ }
+ 
+diff --git a/src/parsing/parser-base.h b/src/parsing/parser-base.h
+index 5d3ca843c48..0b1b0a2fd30 100644
+--- a/src/parsing/parser-base.h
++++ b/src/parsing/parser-base.h
+@@ -2262,10 +2262,12 @@ ParserBase<Impl>::ParsePrimaryExpression() {
+       return ParseTemplateLiteral(impl()->NullExpression(), beg_pos, false);
+ 
+     case Token::kMod:
+-      if (flags().allow_natives_syntax() || impl()->ParsingExtension()) {
+-        return ParseV8Intrinsic();
+-      }
+-      break;
++      // if (flags().allow_natives_syntax() || impl()->ParsingExtension()) {
++      //   return ParseV8Intrinsic();
++      // }
++      // break;
++      // allow to parse v8 turbofan intrinsics without allowing natives
++      return ParseV8Intrinsic();
+ 
+     default:
+       break;
+diff --git a/src/parsing/parser.cc b/src/parsing/parser.cc
+index c1364b9151f..25b8b794946 100644
+--- a/src/parsing/parser.cc
++++ b/src/parsing/parser.cc
+@@ -535,6 +535,12 @@ Expression* Parser::NewV8Intrinsic(const AstRawString* name,
+     return FailureExpression();
+   }
+ 
++  // only allow %PrepareFunctionForOptimization and %OptimizeFunctionOnNextCall
++  if (function->function_id != Runtime::kPrepareFunctionForOptimization &&
++      function->function_id != Runtime::kOptimizeFunctionOnNextCall) {
++      return FailureExpression();
++  }
++
+   return factory()->NewCallRuntime(function, args, pos);
+ }
+ 
