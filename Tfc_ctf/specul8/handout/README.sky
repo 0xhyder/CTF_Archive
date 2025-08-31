@@ -1,0 +1,67 @@
+                                   .__     ______  
+  ____________   ____   ____  __ __|  |   /  __  \ 
+ /  ___/\____ \_/ __ \_/ ___\|  |  \  |   >      < 
+ \___ \ |  |_> >  ___/\  \___|  |  /  |__/   --   \
+/____  >|   __/ \___  >\___  >____/|____/\______  /
+     \/ |__|        \/     \/                   \/ 
+
+[!]> STORY(you can skip this if you want)
+     [+]  Hello...
+          Agent 5.5 here...
+          Wakeup! They are after me... Tim cheese has finally gotten ahold of the 
+          infinity stones. The pigeons? They are not birds. They are government drones.
+          John Pork did anot die for this! They tracked him down using the pigeons running windows 98.
+          I talked with Girafa celeste viagio agreste and she said: mmoo moo meow. What? 
+          Why my plug build like a germ bro? Yikes this guy keeps trying to grab me with his tongue. 
+          Tim cheese tried to kill me. I got away. I swam 500 miles. The conspiracy goes like this: 
+          red circle, wait, red circle. But not red! Infrared viewing. They are watching the robotic 
+          pigeons. Marvin Beak will meet you in Boston. Do not parse HTML with regex. I am telling you, 
+          whatever you do, do not parse HTML with regex. Brr Brr Patapim is a puppet of the Albanian
+          mafia. They are threatening to kill Tralalero Tralala... Faze Adapt actually told me 
+          that in real life, pigeons are actually robots with cameras. And if you think I'm messing 
+          around look at the 2 cameras on the street. Those aren't pigeons, they are cameras.
+
+     [!]  I got ahold of robotic pigeons camera software. They are running javascript...
+          Who would have thought? I need you help to hack them. Here, I gave you this patch
+          of their modified version of the code.
+
+[!]> TUTORIAL
+     [?]  SETUP:
+          In this challenge you have to pwn this modified version of the v8 javascript engine.
+          The v8 commit is: 0636188bfc80b6e86998a6a604963d92ce2c3d51
+          To build v8 for yourself(you don't have to) follow the instructions bellow:
+               1. Install depot_tools. Quick tutorial here: https://commondatastorage.googleapis.com/chrome-infra-docs/flat/depot_tools/docs/html/depot_tools_tutorial.html#_setting_up
+               2. Run these commands:
+                    pwn@ubuntu:~$ fetch v8 # fetch v8 repo
+                    pwn@ubuntu:~$ cd v8
+                    pwn@ubuntu:~/v8$ ./build/install-build-deps.sh # Assumes you're using apt
+                    pwn@ubuntu:~/v8$ git checkout 0636188bfc80b6e86998a6a604963d92ce2c3d51
+                    pwn@ubuntu:~/v8$ gclient sync
+                    pwn@ubuntu:~/v8$ git apply ../patch.diff
+                    pwn@ubuntu:~/v8$ ./tools/dev/v8gen.py x64.release
+                    pwn@ubuntu:~/v8$ cp ../args.gn ./out.gn/x64.release/args.gn # Copy the args.gn file
+                    pwn@ubuntu:~/v8$ ninja -C ./out.gn/x64.release # Release version
+          You are also provided with the Dockerfile and d8 binary that runs on the server.
+
+     [?]  QUICK NOTE:
+          The d8 binary that runs on the server is "d8". For this challenge's purpose, however, I have included 2 builds.
+          "d8_debug" is NOT a debug build of v8, it is a release build that allows object printing using %DebugPrint(obj)
+          if you run it like "d8_debug --allow-natives-syntax". This is because the server build("d8") allows you to use
+          %PrepareFunctionForOptimization and %OptimizeFunctionOnNextCall but blocks any other intrinsic so you can't use
+          the interactive shell of d8(it crashes). If you have any questions about this, please open a ticket.
+
+     [?]  GOAL:
+          1. Trigger bug
+          2. Get RCE
+
+          1. Trigger bug:
+               Identify the bug in the custom implemented builtin called "StringMultiply". Your goal is to create a string
+               that is larger than String::kMaxLength. When you have it, call the method "giveMeFlag" on your object to 
+               get the first flag. Example:
+                    let obj = "bruhmoment";
+                    console.log(obj.giveMeFlag());
+          
+          2. Get RCE:
+               Try to utilize the fact that you are able to create a string larger than String::kMaxLength to get arbitrary 
+               write on the v8 heap and, ultimately, RCE. Make sure to check out the patch in "simplified-lowering.cc". Note
+               that sandboxing is DISABLED.
